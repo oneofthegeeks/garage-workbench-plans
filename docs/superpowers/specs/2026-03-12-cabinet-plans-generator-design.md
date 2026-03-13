@@ -68,10 +68,10 @@ The `config` object is the single source of truth. It flows from `useCabinetConf
     topThickness: Number,  // inches, default 1.5
   },
   materials: {
-    box: String,           // e.g. "3/4\" MDF"
-    top: String,           // e.g. "3/4\" plywood (2 layers)"
-    toeKick: String,       // e.g. "3/4\" plywood"
-    drawerBox: String,     // e.g. "1/2\" plywood"
+    box: String,           // key into MATERIAL_THICKNESS (see below)
+    top: String,           // display label only — thickness comes from dimensions.topThickness; intentionally NOT a key in MATERIAL_THICKNESS
+    toeKick: String,       // key into MATERIAL_THICKNESS
+    drawerBox: String,     // key into MATERIAL_THICKNESS
   },
   sections: [
     {
@@ -101,6 +101,33 @@ The `config` object is the single source of truth. It flows from `useCabinetConf
 
 **Invariant:** `sections.reduce((sum, s) => sum + s.width, 0) === dimensions.wallWidth`
 The wizard enforces this — Step 2 cannot advance until the total matches.
+
+**Material thickness lookup — `MATERIAL_THICKNESS`**
+Defined as a constant in `src/calculators/buildCutList.js` and shared wherever thickness is needed:
+```js
+export const MATERIAL_THICKNESS = {
+  '3/4" MDF':     0.75,
+  '3/4" plywood': 0.75,
+  '1/2" plywood': 0.5,
+  '1/4" plywood': 0.25,
+};
+```
+`materials.box`, `materials.toeKick`, and `materials.drawerBox` must be keys in this object. The select options in Step 1 are sourced from `Object.keys(MATERIAL_THICKNESS)` so they stay in sync automatically.
+
+**Interior height formula** (used by `buildCutList` and the Step 3 drawer validator):
+```
+boxHeight     = surfaceHeight − toeKickHeight − topThickness
+interiorHeight = boxHeight − 2 × MATERIAL_THICKNESS[materials.box]
+```
+For custom sections with a `surfaceOffset`, `boxHeight` uses `surfaceHeight + surfaceOffset` instead.
+
+**`interior` type isolation** — when a user changes `interior.type` in Step 3, `useCabinetConfig.updateSectionInterior` replaces the entire `interior` object with a fresh default for the new type. It does not preserve fields from the previous type. Default values per type:
+```js
+{ type: 'drawers',  drawers: [{ height: 0 }, { height: 0 }, { height: 0 }] }
+{ type: 'shelves',  shelfCount: 2, shelfMount: 'pocket-screw' }
+{ type: 'open',     label: '' }
+{ type: 'custom',   label: '', surfaceOffset: 0, openBelow: false, note: '' }
+```
 
 ---
 
@@ -133,8 +160,8 @@ App
 
 These functions are completely independent of the React tree. They take a `config` and return data. They can be developed, tested, and reasoned about without touching the UI.
 
-### `buildElevationSVG(config) → SVGElement`
-Renders the front elevation. Scales to fit the container. Color-codes sections by `section.color`. Handles `interior.surfaceOffset` for custom sections. Shows dimension annotations (widths, overall width, height, toe kick). Highlights the active section when passed an optional `activeId`.
+### `buildElevationSVG(config, options?) → String`
+Returns an SVG markup string (not a DOM node). Renders the front elevation at a fixed `viewBox` with a responsive `width="100%"`. Color-codes sections by `section.color`. Handles `interior.surfaceOffset` for custom sections. Shows dimension annotations (widths, overall width, height, toe kick). Accepts an optional `{ activeId: String }` — when set, draws a dashed highlight rect around that section. Used both in `<ElevationSVG>` (via `dangerouslySetInnerHTML`) and in `buildPlansHTML` (direct string embed).
 
 ### `buildCutList(config) → CutListData`
 Returns a structured object:
@@ -161,6 +188,24 @@ Assembles a complete, self-contained HTML document (same blueprint aesthetic as 
 
 ### `decodeConfig(hash) → config | null`
 `atob(hash)` → `JSON.parse()` → validates shape → returns config or null on failure.
+
+**Minimum valid shape** — a config passes validation if it has:
+- `meta.name` (string, non-empty)
+- `dimensions.wallWidth` > 0
+- `dimensions.surfaceHeight` > 0
+- `dimensions.depth` > 0
+- `dimensions.toeKickHeight` >= 0
+- `dimensions.topThickness` > 0
+- `materials.box` is a key in `MATERIAL_THICKNESS`
+- `sections` is a non-empty array where every entry has `id`, `name`, `width` > 0, and `interior.type` in `["drawers","shelves","open","custom"]`
+- `sections` widths sum to `dimensions.wallWidth`
+
+If validation fails for any reason (malformed base64, invalid JSON, missing fields, width mismatch), return `null`. The caller shows the wizard from scratch — no error message to the user, just a fresh start.
+
+### `buildCSV(cutListData) → String`
+Exported from `src/calculators/buildCutList.js` alongside `buildCutList`. Takes the `CutListData` object returned by `buildCutList` and returns a CSV string with headers:
+`Section,Part,Material,Width (in),Height (in),Qty,Notes`
+One row per part across all sections, followed by a blank row, then hardware rows. Hardware rows use the same 7 columns: Section is `"Hardware"`, Part is `item`, Material/Width/Height are empty strings, Qty and Notes map directly.
 
 ---
 
@@ -193,7 +238,7 @@ Steps through sections one at a time with Prev/Next section controls (separate f
 
 **Interior type forms:**
 
-- **Drawers:** Shows current drawer list with height fields. "Auto-distribute" button divides available interior height equally. User can add/remove drawers. Live validation: drawer heights must sum to interior height.
+- **Drawers:** Shows current drawer list with height fields. "Auto-distribute" button sets each drawer height to `floor(interiorHeight / drawerCount)`, with any remainder added to the last drawer. Live validation: drawer heights must sum to `interiorHeight` (calculated as `boxHeight − 2 × MATERIAL_THICKNESS[materials.box]`, where `boxHeight = surfaceHeight − toeKickHeight − topThickness`). Step 3 cannot advance past a drawers section until this validation passes.
 - **Shelves:** Shelf count (number). Shelf mount method (pocket-screw / shelf-pins). Displays calculated bay heights.
 - **Open:** Label field only. Nothing else to configure.
 - **Custom:** Label, surface offset (number, can be negative), open below (checkbox), notes (text area).
@@ -201,7 +246,7 @@ Steps through sections one at a time with Prev/Next section controls (separate f
 ### Step 4: Review
 - Full-width elevation SVG at top
 - Section summary table
-- Cut list preview (first 5 rows of each section, "Show all" toggle)
+- Cut list preview (first 5 rows of each section, collapsed by default; "Show all" toggle expands to full list)
 - Sheet count summary
 - Hardware list
 - Three output actions: Generate Plans, Download CSV, Copy Share Link
@@ -216,7 +261,7 @@ Steps through sections one at a time with Prev/Next section controls (separate f
 const blob = new Blob([html], { type: 'text/html' });
 window.open(URL.createObjectURL(blob));
 ```
-The generated page matches the blueprint aesthetic of the existing garage plans site: dark navy background, IBM Plex Mono for dimensions, Oswald for headers, green/blue/orange section color coding.
+The generated page matches the blueprint aesthetic of the existing garage plans site: dark navy background, IBM Plex Mono for dimensions, Oswald for headers, green/blue/orange section color coding. Fonts are loaded from Google Fonts via a `<link>` tag embedded in the generated HTML — this requires a network connection to render correctly. Print styles switch to white background and black text for paper output.
 
 ### CSV Download
 ```js
@@ -247,14 +292,14 @@ if (hash) {
 
 ## Presets
 
-Defined as a static array in `src/presets.js`. Each preset is a complete `config` object.
+Defined as a static array in `src/presets.js`. Each preset (except `blank`) is a complete `config` object. Loading a preset copies it into `useCabinetConfig` state — the original preset object is never mutated. `meta.preset` is set to the preset key on load and cleared to `null` the first time the user edits any field after loading. This means `meta.preset` indicates "this config started as preset X" for display purposes only — it is never re-applied after load.
 
 | Key | Name | Wall Width | Sections |
 |-----|------|-----------|----------|
 | `garage-workbench` | Garage Workbench | 108" | 24" drawers · 20" shelves · 20" miter · 20" shelves · 24" drawers |
 | `shop-storage` | Shop Storage Wall | 96" | 24" drawers · 24" shelves · 24" shelves · 24" drawers |
 | `laundry-room` | Laundry Room | 72" | 24" drawers · 24" open · 24" drawers |
-| `blank` | Start from Scratch | — | Empty sections, user sets wall width first |
+| `blank` | Start from Scratch | — | Lands directly on Step 1 with all fields empty; `meta.preset` is null |
 
 ---
 
@@ -286,10 +331,10 @@ cabinet-plans-generator/
     ├── hooks/
     │   └── useCabinetConfig.js
     ├── calculators/
-    │   ├── buildElevationSVG.js
-    │   ├── buildCutList.js
-    │   ├── buildPlansHTML.js
-    │   └── encodeConfig.js
+    │   ├── buildElevationSVG.js   // exports: buildElevationSVG(config, options?)
+    │   ├── buildCutList.js        // exports: buildCutList(config), buildCSV(cutListData), MATERIAL_THICKNESS
+    │   ├── buildPlansHTML.js      // exports: buildPlansHTML(config)
+    │   └── encodeConfig.js        // exports: encodeConfig(config), decodeConfig(hash)
     ├── components/
     │   ├── LandingScreen/
     │   ├── WizardShell/
